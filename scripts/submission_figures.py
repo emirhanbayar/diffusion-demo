@@ -139,7 +139,8 @@ def make_adversarial(num_points: int = 350, seed: int = 0,
 # These paint the plane with the label *humans* would extrapolate.
 
 def real_signal_stripes(ax, num_stripes: int = 4,
-                        x_range: tuple[float, float] = (-2.0, 2.0)) -> None:
+                        x_range: tuple[float, float] = (-2.0, 2.0),
+                        **_unused) -> None:
     width = (x_range[1] - x_range[0]) / num_stripes
     for i in range(num_stripes):
         x_lo = x_range[0] + i * width
@@ -149,7 +150,8 @@ def real_signal_stripes(ax, num_stripes: int = 4,
 
 
 def real_signal_chess(ax, n_axis: int = 5,
-                      axis_lim: tuple[float, float] = (-2.0, 2.0)) -> None:
+                      axis_lim: tuple[float, float] = (-2.0, 2.0),
+                      **_unused) -> None:
     axis_vals = np.linspace(axis_lim[0], axis_lim[1], n_axis)
     cell_size = (axis_lim[1] - axis_lim[0]) / (n_axis - 1)
     for i, x_c in enumerate(axis_vals):
@@ -161,7 +163,8 @@ def real_signal_chess(ax, n_axis: int = 5,
 
 
 def real_signal_adversarial(ax, n_unique: int = 7,
-                            axis_lim: tuple[float, float] = (-1.0, 1.0)) -> None:
+                            axis_lim: tuple[float, float] = (-1.0, 1.0),
+                            **_unused) -> None:
     """Voronoi vertical-stripe partition: each x-position owns a band; label = parity."""
     xs_unique = np.linspace(axis_lim[0], axis_lim[1], n_unique)
     # extend beyond axis_lim to fill the visible area
