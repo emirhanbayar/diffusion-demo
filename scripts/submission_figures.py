@@ -182,13 +182,39 @@ class ToyConfig:
     row_label: str           # short row label for the combined 3×4 figure
     single_title: str        # full title used when this mode is rendered alone
     data_fn: Callable
-    real_signal_fn: Callable
-    inv_scale: tuple[float, float]   # multiply data by this before training
+    real_signal_fn: Callable | None     # painter for "ground_truth" panels (None ⇒ no GT panel)
+    inv_scale: tuple[float, float]      # multiply data by this before training
+    column_kinds: tuple[str, str, str, str]
+    column_headers: tuple[str, str, str, str]
     axes_lim: tuple[float, float] = (-2.5, 2.5)
     extra_data_args: dict = field(default_factory=dict)
 
 
 D_X_ADV, D_Y_ADV = 20, 3000  # effective dimensions for the adversarial mode
+
+# ``column_kinds`` is what each panel sources its content from:
+#   "ground_truth"  – painted by real_signal_fn (no model, no field)
+#   "vanilla"       – MLP with cross-entropy on clean data
+#   "noise_aug"     – MLP with cross-entropy on noised data, ρ ≡ 1 (= adv. training)
+#   "coupled"       – MLP with coupled CE on (x_t, c_t) under matched ρ(t)  (ours)
+#   "dc"            – diffusion classifier accumulated over t
+
+_HEADERS_DEFAULT = (
+    "Ground-truth labels",
+    "Vanilla CE",
+    r"Coupled CE — matched $\rho(t)$  (ours)",
+    "Diffusion classifier",
+)
+_KINDS_DEFAULT = ("ground_truth", "vanilla", "coupled", "dc")
+
+_HEADERS_ADV = (
+    "Vanilla CE  (no aug.)",
+    "Adversarial training",
+    r"Coupled CE — matched $\rho(t)$  (ours)",
+    "Diffusion classifier",
+)
+_KINDS_ADV = ("vanilla", "noise_aug", "coupled", "dc")
+
 
 CONFIGS = {
     "stripes": ToyConfig(
@@ -198,6 +224,8 @@ CONFIGS = {
         data_fn=make_stripes,
         real_signal_fn=real_signal_stripes,
         inv_scale=(1.0, 1.0),
+        column_kinds=_KINDS_DEFAULT,
+        column_headers=_HEADERS_DEFAULT,
         axes_lim=(-2.5, 2.5),
         extra_data_args={"num_stripes": 4, "y_shortcut": 0.08, "y_jitter": 0.02},
     ),
@@ -208,6 +236,8 @@ CONFIGS = {
         data_fn=make_chess,
         real_signal_fn=real_signal_chess,
         inv_scale=(1.0, 1.0),
+        column_kinds=_KINDS_DEFAULT,
+        column_headers=_HEADERS_DEFAULT,
         axes_lim=(-2.7, 2.7),
         extra_data_args={"n_axis": 5, "jitter": 0.08},
     ),
@@ -219,20 +249,15 @@ CONFIGS = {
             "$\\sigma_x{=}\\sigma\\sqrt{20}$, $\\sigma_y{=}\\sigma\\sqrt{3000}$"
         ),
         data_fn=make_adversarial,
-        real_signal_fn=real_signal_adversarial,
+        real_signal_fn=None,
         # (1/√D_x, 1/√D_y): noise σ in the prescaled space ⇒ σ·√D in original space
         inv_scale=(1.0 / float(np.sqrt(D_X_ADV)), 1.0 / float(np.sqrt(D_Y_ADV))),
+        column_kinds=_KINDS_ADV,
+        column_headers=_HEADERS_ADV,
         axes_lim=(-2.5, 2.5),
         extra_data_args={"n_unique": 7, "axis_lim": (-1.0, 1.0), "jitter": 0.005},
     ),
 }
-
-COL_HEADERS = (
-    "Ground-truth labels",
-    "Vanilla CE",
-    r"Coupled CE — matched $\rho(t)$  (ours)",
-    "Diffusion classifier",
-)
 
 
 def apply_scale(X: np.ndarray, inv_scale: tuple[float, float]) -> np.ndarray:
@@ -415,6 +440,48 @@ def train_or_load_coupled(X, Y, ddpm: DDPMTab, rho: torch.Tensor, out_dir: Path,
     return m.eval().to(device)
 
 
+def train_or_load_noise_aug(X, Y, ddpm: DDPMTab, rho: torch.Tensor, out_dir: Path,
+                            epochs: int = 1500, seed: int = 0,
+                            device: torch.device = torch.device("cpu")) -> MLP:
+    """MLP trained with noise-augmented inputs and *sharp* labels (ρ ≡ 1).
+
+    This is the matched-ρ schedule's noise sampler stripped of the soft-label
+    component — equivalent to adding the same anisotropic noise as our coupled
+    training but using one-hot targets. In the adversarial-robustness toy this
+    reproduces the dimpled-manifold adversarial-training behaviour (Melamed et
+    al., 2023) — boundary cleanly fits the noised data manifold but stays
+    unconstrained off it.
+    """
+    ckpt = out_dir / "noise_aug.pt"
+    if ckpt.exists():
+        m = MLP()
+        m.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        return m.eval().to(device)
+    torch.manual_seed(seed)
+    x_t = torch.tensor(X, dtype=torch.float32, device=device)
+    y_t = torch.tensor(Y, dtype=torch.long, device=device)
+    m = MLP().to(device)
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3)
+    n = x_t.shape[0]; T = ddpm.num_steps
+    drho = (rho[:T] - rho[1:T + 1]).abs().clamp(min=1e-9).to(device)
+    t_dist = torch.distributions.Categorical(probs=(drho / drho.sum()).double())
+    g = torch.Generator(device=device).manual_seed(seed)
+    for ep in range(epochs):
+        perm = torch.randperm(n, generator=g, device=device)
+        for s in range(0, n, 64):
+            idx = perm[s:s + 64]
+            xb, yb = x_t[idx], y_t[idx]
+            tids = t_dist.sample((xb.shape[0],)).to(device)
+            eps = torch.randn(xb.shape, generator=g, device=device)
+            xt = get_xt(ddpm, xb, tids, eps)
+            loss = F.cross_entropy(m(xt), yb)
+            opt.zero_grad(); loss.backward(); opt.step()
+        if (ep + 1) % 250 == 0:
+            print(f"  noise-aug ep {ep + 1:>4}  CE {float(loss.detach()):.4f}")
+    torch.save(m.state_dict(), ckpt)
+    return m.eval().to(device)
+
+
 # ---------------- field helpers ----------------
 
 @torch.no_grad()
@@ -461,31 +528,40 @@ def per_pixel_per_t_errors(ddpm: DDPMTab, grid: torch.Tensor, num_eps: int = 8,
 
 def compute_mode_fields(
     cfg: ToyConfig,
-    X_train: np.ndarray, vanilla: MLP, coupled: MLP, ddpm: DDPMTab,
+    vanilla: MLP | None, coupled: MLP | None, ddpm: DDPMTab,
+    noise_aug: MLP | None = None,
     grid_n: int = 160, dc_num_eps: int = 16, dc_t_ref: int = 37,
     seed: int = 0, device: torch.device = torch.device("cpu"),
 ) -> dict:
-    """Run the per-pixel field computation for vanilla / coupled / DC.
+    """Compute per-pixel probability fields for whichever models the mode needs.
 
-    Returns dict with grid coordinates and three (grid_n, grid_n) probability
-    fields ``P_v``, ``P_c``, ``P_dc`` (all on the ``P(c=1|x) - 0.5`` scale).
+    Returns ``{"A", "B"}`` plus one ``"P_<kind>"`` entry for every
+    non-``ground_truth`` kind in ``cfg.column_kinds``.
     """
     A, B, grid_orig = make_xy_grid(grid_n, lim=cfg.axes_lim, device=device)
     scale_t = torch.tensor(cfg.inv_scale, dtype=torch.float32, device=device)
     grid_train = grid_orig * scale_t
+    out: dict = {"A": A, "B": B}
 
-    s_v = np.clip(mlp_grid(vanilla, grid_train), -50, 50)
-    s_c = np.clip(mlp_grid(coupled, grid_train), -50, 50)
-    P_v = (1.0 / (1.0 + np.exp(-s_v)) - 0.5).reshape(grid_n, grid_n)
-    P_c = (1.0 / (1.0 + np.exp(-s_c)) - 0.5).reshape(grid_n, grid_n)
+    needed = set(cfg.column_kinds)
 
-    print(f"[{cfg.name}] computing DC per-pixel errors over T={ddpm.num_steps} steps")
-    err = per_pixel_per_t_errors(ddpm, grid_train, num_eps=dc_num_eps, seed=seed)
-    diff = (err[dc_t_ref:, :, 0] - err[dc_t_ref:, :, 1]).sum(dim=0)
-    temperature = float(torch.quantile(diff.abs(), 0.90).clamp(min=1e-6))
-    P_dc = (torch.sigmoid(diff * (4.0 / temperature)) - 0.5).numpy().reshape(grid_n, grid_n)
+    if "vanilla" in needed and vanilla is not None:
+        s = np.clip(mlp_grid(vanilla, grid_train), -50, 50)
+        out["P_vanilla"] = (1.0 / (1.0 + np.exp(-s)) - 0.5).reshape(grid_n, grid_n)
+    if "coupled" in needed and coupled is not None:
+        s = np.clip(mlp_grid(coupled, grid_train), -50, 50)
+        out["P_coupled"] = (1.0 / (1.0 + np.exp(-s)) - 0.5).reshape(grid_n, grid_n)
+    if "noise_aug" in needed and noise_aug is not None:
+        s = np.clip(mlp_grid(noise_aug, grid_train), -50, 50)
+        out["P_noise_aug"] = (1.0 / (1.0 + np.exp(-s)) - 0.5).reshape(grid_n, grid_n)
+    if "dc" in needed:
+        print(f"[{cfg.name}] computing DC per-pixel errors over T={ddpm.num_steps} steps")
+        err = per_pixel_per_t_errors(ddpm, grid_train, num_eps=dc_num_eps, seed=seed)
+        diff = (err[dc_t_ref:, :, 0] - err[dc_t_ref:, :, 1]).sum(dim=0)
+        temperature = float(torch.quantile(diff.abs(), 0.90).clamp(min=1e-6))
+        out["P_dc"] = (torch.sigmoid(diff * (4.0 / temperature)) - 0.5).numpy().reshape(grid_n, grid_n)
 
-    return {"A": A, "B": B, "P_v": P_v, "P_c": P_c, "P_dc": P_dc}
+    return out
 
 
 def _scatter_data(ax, X_orig: np.ndarray, Y: np.ndarray, size: int = 10):
@@ -495,29 +571,47 @@ def _scatter_data(ax, X_orig: np.ndarray, Y: np.ndarray, size: int = 10):
                edgecolors="white", lw=0.3, zorder=4)
 
 
+def _paint_panel(ax, cfg: ToyConfig, kind: str, fields: dict,
+                 X_orig: np.ndarray, Y: np.ndarray,
+                 cmap: str = "RdBu_r", vmax: float = 0.5,
+                 scatter_size: int = 10):
+    """Paint one panel based on ``kind`` (``ground_truth`` / ``vanilla`` / ...).
+
+    Returns the AxesImage for non-GT panels (so the caller can hook a colorbar
+    onto it), or ``None`` for the ground-truth panel.
+    """
+    im = None
+    if kind == "ground_truth":
+        if cfg.real_signal_fn is not None:
+            cfg.real_signal_fn(ax, **cfg.extra_data_args)
+    else:
+        F_ = fields[f"P_{kind}"]
+        im = ax.pcolormesh(fields["A"], fields["B"], F_, shading="auto",
+                           cmap=cmap, vmin=-vmax, vmax=vmax)
+        ax.contour(fields["A"], fields["B"], F_, levels=[0.0],
+                   colors="k", linewidths=0.9)
+    _scatter_data(ax, X_orig, Y, size=scatter_size)
+    return im
+
+
 def fig_single_mode(cfg: ToyConfig, X_orig: np.ndarray, Y: np.ndarray,
                     fields: dict, out_path: Path) -> None:
     """1×4 figure for a single toy mode."""
-    A, B = fields["A"], fields["B"]
     fig, axes = plt.subplots(1, 4, figsize=(13.0, 3.7), sharey=True,
                              gridspec_kw={"wspace": 0.10})
-    cmap = "RdBu_r"; vmax = 0.5
-
-    cfg.real_signal_fn(axes[0], **cfg.extra_data_args)
-    im = None
-    for ax, F_ in zip(axes[1:], (fields["P_v"], fields["P_c"], fields["P_dc"])):
-        im = ax.pcolormesh(A, B, F_, shading="auto", cmap=cmap, vmin=-vmax, vmax=vmax)
-        ax.contour(A, B, F_, levels=[0.0], colors="k", linewidths=0.9)
-
-    for ax, header in zip(axes, COL_HEADERS):
-        _scatter_data(ax, X_orig, Y, size=10)
+    last_im = None
+    for ax, kind, header in zip(axes, cfg.column_kinds, cfg.column_headers):
+        im = _paint_panel(ax, cfg, kind, fields, X_orig, Y, scatter_size=10)
+        if im is not None:
+            last_im = im
         ax.set_xlim(*cfg.axes_lim); ax.set_ylim(*cfg.axes_lim); ax.set_aspect("equal")
         ax.set_xlabel("x")
         ax.set_title(header)
     axes[0].set_ylabel("y")
 
-    cbar = fig.colorbar(im, ax=axes, shrink=0.82, fraction=0.022, pad=0.015)
-    cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$")
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=axes, shrink=0.82, fraction=0.022, pad=0.015)
+        cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$")
 
     fig.suptitle(cfg.single_title, y=1.03, fontsize=10)
     fig.savefig(out_path)
@@ -526,43 +620,33 @@ def fig_single_mode(cfg: ToyConfig, X_orig: np.ndarray, Y: np.ndarray,
 
 
 def fig_combined_three(results: list[dict], out_path: Path) -> None:
-    """3×4 figure: rows = three toys, columns = ground truth / vanilla / ours / DC."""
-    fig, axes = plt.subplots(3, 4, figsize=(13.0, 9.6),
-                             gridspec_kw={"wspace": 0.08, "hspace": 0.20,
-                                          "left": 0.07, "right": 0.92,
-                                          "top": 0.94, "bottom": 0.04})
-    cmap = "RdBu_r"; vmax = 0.5
+    """3×4 figure: rows = three toys, each row has its own column titles
+    (because the adversarial row's columns differ from the other two)."""
+    fig, axes = plt.subplots(3, 4, figsize=(13.0, 10.0),
+                             gridspec_kw={"wspace": 0.08, "hspace": 0.32,
+                                          "left": 0.06, "right": 0.92,
+                                          "top": 0.96, "bottom": 0.03})
     last_im = None
 
     for row, res in enumerate(results):
         cfg = res["cfg"]
-        f = res["fields"]
         row_axes = axes[row]
-
-        cfg.real_signal_fn(row_axes[0], **cfg.extra_data_args)
-
-        for ax, F_ in zip(row_axes[1:], (f["P_v"], f["P_c"], f["P_dc"])):
-            im = ax.pcolormesh(f["A"], f["B"], F_, shading="auto",
-                               cmap=cmap, vmin=-vmax, vmax=vmax)
-            ax.contour(f["A"], f["B"], F_, levels=[0.0], colors="k", linewidths=0.8)
-            last_im = im
-
-        for ax in row_axes:
-            _scatter_data(ax, res["X_orig"], res["Y"], size=8)
+        for ax, kind, header in zip(row_axes, cfg.column_kinds, cfg.column_headers):
+            im = _paint_panel(ax, cfg, kind, res["fields"], res["X_orig"], res["Y"],
+                              scatter_size=8)
+            if im is not None:
+                last_im = im
             ax.set_xlim(*cfg.axes_lim); ax.set_ylim(*cfg.axes_lim)
             ax.set_aspect("equal")
             ax.set_xticks([]); ax.set_yticks([])
-
+            ax.set_title(header, fontsize=10)
         # Row label on the far-left panel
         row_axes[0].set_ylabel(cfg.row_label, fontsize=11, rotation=0,
                                ha="right", va="center", labelpad=22)
 
-    # Column headers on the top row only
-    for ax, header in zip(axes[0], COL_HEADERS):
-        ax.set_title(header, fontsize=10.5)
-
-    cbar = fig.colorbar(last_im, ax=axes, shrink=0.55, fraction=0.018, pad=0.012)
-    cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$", fontsize=10)
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=axes, shrink=0.55, fraction=0.018, pad=0.012)
+        cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$", fontsize=10)
 
     fig.savefig(out_path)
     print(f"saved {out_path}")
@@ -666,17 +750,26 @@ def run_one_mode(mode: str, args, device: torch.device) -> dict:
         )
         torch.save({"raw": rho_raw, "clean": rho_clean}, rho_path)
 
-    print("[mlp] vanilla")
-    vanilla = train_or_load_vanilla(X_train, Y, mode_ckpt_dir,
-                                    epochs=args.vanilla_epochs,
-                                    seed=args.seed, device=device)
-    print("[mlp] coupled")
-    coupled = train_or_load_coupled(X_train, Y, ddpm, rho_clean, mode_ckpt_dir,
-                                    epochs=args.coupled_epochs,
-                                    seed=args.seed, device=device)
+    needs = set(cfg.column_kinds)
+    vanilla = coupled = noise_aug = None
+    if "vanilla" in needs:
+        print("[mlp] vanilla")
+        vanilla = train_or_load_vanilla(X_train, Y, mode_ckpt_dir,
+                                        epochs=args.vanilla_epochs,
+                                        seed=args.seed, device=device)
+    if "coupled" in needs:
+        print("[mlp] coupled")
+        coupled = train_or_load_coupled(X_train, Y, ddpm, rho_clean, mode_ckpt_dir,
+                                        epochs=args.coupled_epochs,
+                                        seed=args.seed, device=device)
+    if "noise_aug" in needs:
+        print("[mlp] noise-aug (ρ≡1, sharp labels)")
+        noise_aug = train_or_load_noise_aug(X_train, Y, ddpm, rho_clean, mode_ckpt_dir,
+                                            epochs=args.coupled_epochs,
+                                            seed=args.seed, device=device)
 
     fields = compute_mode_fields(
-        cfg, X_train, vanilla, coupled, ddpm,
+        cfg, vanilla, coupled, ddpm, noise_aug=noise_aug,
         grid_n=args.decisions_grid_n, dc_num_eps=args.decisions_num_eps,
         dc_t_ref=args.decisions_t_ref, seed=args.seed, device=device,
     )

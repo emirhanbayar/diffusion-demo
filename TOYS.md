@@ -13,12 +13,37 @@ toy showing all four side by side.
 | `--mode`        | Story                          | Data                                              | What we compare                                                          |
 | --------------- | ------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------ |
 | `stripes`       | **Spurious correlation**       | Stripe labels along `x`; planted `y` shortcut     | Vanilla follows the easy y-shortcut; ours / DC use the real x-stripe signal |
-| `chess`         | **Alignment with humans**      | 5×5 chess pattern, 25 jittered cell centres       | Vanilla over-extrapolates; ours / DC respect the chess cells             |
-| `adversarial`   | **Off-manifold robustness**    | 7 alternating-label points along `y=0` (Melamed)  | y is "3000-D off-manifold", x is "20-D on-manifold" — anisotropic noise  |
+| `chess`         | **Human-aligned concept**      | 5×5 chess pattern, 25 jittered cell centres       | Vanilla over-extrapolates; ours / DC respect the chess cells             |
+| `adversarial`   | **Off-manifold robustness**    | 7 alternating-label points along `y=0` (Melamed)  | y = "3000-D off-manifold", x = "20-D on-manifold" — anisotropic noise    |
 
-In all cases panel **(a)** shows the *real signal* — what a human would paint
-the plane as given only the training points — and the remaining three panels
-show each classifier's `P(c=1 | x) − 0.5` field.
+The four panels per mode are:
+
+| Mode               | Col 1                       | Col 2                  | Col 3                                    | Col 4                  |
+| ------------------ | --------------------------- | ---------------------- | ---------------------------------------- | ---------------------- |
+| `stripes`/`chess`  | Ground-truth labels         | Vanilla CE             | Coupled CE — matched ρ(t) (ours)         | Diffusion classifier   |
+| `adversarial`      | Vanilla CE (no aug.)        | Adversarial training   | Coupled CE — matched ρ(t) (ours)         | Diffusion classifier   |
+
+Where:
+
+- **Vanilla CE (no aug.)** — standard cross-entropy on the clean training points.
+- **Adversarial training** — same noise-augmentation sampler as ours
+  (`t ~ q(t) ∝ |Δρ(t)|`, anisotropic noise via prescaling) but with **sharp**
+  one-hot targets (ρ ≡ 1). This reproduces the dimpled-manifold adversarial-
+  training behaviour from Melamed et al. (2023): the boundary fits the noised
+  data manifold cleanly but stays unconstrained off it.
+- **Coupled CE (ours)** — same noise sampler, but with the matched-ρ soft
+  target `c_t = ρ(t)·onehot(c) + (1−ρ(t))·u`.
+- **Diffusion classifier** — the trained DDPM accumulating
+  `Σ_{t ≥ t_ref}(‖ε−ε_θ(c=0)‖² − ‖ε−ε_θ(c=1)‖²)`.
+
+For `stripes` and `chess` we don't show "adversarial training" because there
+is no off-manifold ambiguity — the data is dense and the relevant comparison
+is *what feature the classifier latches onto*, not *what it does far from
+data*. Conversely, for `adversarial` there's no clean "ground truth" panel
+because the adversarial-robustness story is precisely about the
+*non-existence* of any pattern between the seven training points: each
+classifier paints its own reasonable extrapolation, and the four panels show
+how different training procedures shape that extrapolation.
 
 ## How the adversarial mode encodes the high-dim story
 
