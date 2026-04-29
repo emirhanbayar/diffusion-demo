@@ -52,18 +52,31 @@ For `stripes` and `chess`, `inv_scale = (1, 1)` and the prescale is a no-op.
 ## Running
 
 ```bash
-# A single toy:
+# A single toy (writes assets/fig_<mode>_toy.pdf):
 python scripts/submission_figures.py --mode stripes
 python scripts/submission_figures.py --mode chess
 python scripts/submission_figures.py --mode adversarial
 
-# Or all three sequentially:
-for m in stripes chess adversarial; do
-    python scripts/submission_figures.py --mode "$m"
-done
+# All three at once — also writes a 3×4 combined figure
+# (assets/fig_three_toys.pdf) in addition to the three single-mode PDFs:
+python scripts/submission_figures.py --mode all
 ```
 
-Each run writes `assets/fig_<mode>_toy.pdf`.
+Outputs:
+
+```
+assets/
+├── fig_stripes_toy.pdf       # 1×4 — stripes only
+├── fig_chess_toy.pdf         # 1×4 — chess only
+├── fig_adversarial_toy.pdf   # 1×4 — adversarial only
+└── fig_three_toys.pdf        # 3×4 — combined (only when --mode all)
+```
+
+The combined figure has rows labeled
+**Spurious correlation / Human-aligned concept / Adversarial robustness**
+and columns labeled
+**Ground-truth labels / Vanilla CE / Coupled CE — matched ρ(t) (ours) /
+Diffusion classifier**, sharing a single `P(c=1|x) − 0.5` colour scale.
 
 ### GPU vs CPU
 

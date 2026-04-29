@@ -179,7 +179,8 @@ def real_signal_adversarial(ax, n_unique: int = 7,
 @dataclass
 class ToyConfig:
     name: str
-    title: str
+    row_label: str           # short row label for the combined 3×4 figure
+    single_title: str        # full title used when this mode is rendered alone
     data_fn: Callable
     real_signal_fn: Callable
     inv_scale: tuple[float, float]   # multiply data by this before training
@@ -192,7 +193,8 @@ D_X_ADV, D_Y_ADV = 20, 3000  # effective dimensions for the adversarial mode
 CONFIGS = {
     "stripes": ToyConfig(
         name="stripes",
-        title="Spurious correlation: x-stripe labels with a planted y-shortcut",
+        row_label="Spurious\ncorrelation",
+        single_title="Spurious correlation: x-stripe labels with a planted y-shortcut",
         data_fn=make_stripes,
         real_signal_fn=real_signal_stripes,
         inv_scale=(1.0, 1.0),
@@ -201,7 +203,8 @@ CONFIGS = {
     ),
     "chess": ToyConfig(
         name="chess",
-        title="Human alignment: 5×5 chess pattern, no shortcut",
+        row_label="Human-aligned\nconcept",
+        single_title="Human-aligned concept: 5×5 chess pattern, no shortcut",
         data_fn=make_chess,
         real_signal_fn=real_signal_chess,
         inv_scale=(1.0, 1.0),
@@ -210,7 +213,11 @@ CONFIGS = {
     ),
     "adversarial": ToyConfig(
         name="adversarial",
-        title="Off-manifold robustness: 1D points in 2D, anisotropic noise (y=3000-D, x=20-D)",
+        row_label="Adversarial\nrobustness",
+        single_title=(
+            "Adversarial robustness: 1D points in 2D — "
+            "$\\sigma_x{=}\\sigma\\sqrt{20}$, $\\sigma_y{=}\\sigma\\sqrt{3000}$"
+        ),
         data_fn=make_adversarial,
         real_signal_fn=real_signal_adversarial,
         # (1/√D_x, 1/√D_y): noise σ in the prescaled space ⇒ σ·√D in original space
@@ -219,6 +226,13 @@ CONFIGS = {
         extra_data_args={"n_unique": 7, "axis_lim": (-1.0, 1.0), "jitter": 0.005},
     ),
 }
+
+COL_HEADERS = (
+    "Ground-truth labels",
+    "Vanilla CE",
+    r"Coupled CE — matched $\rho(t)$  (ours)",
+    "Diffusion classifier",
+)
 
 
 def apply_scale(X: np.ndarray, inv_scale: tuple[float, float]) -> np.ndarray:
@@ -443,71 +457,113 @@ def per_pixel_per_t_errors(ddpm: DDPMTab, grid: torch.Tensor, num_eps: int = 8,
     return err.cpu()
 
 
-# ---------------- the 4-panel toy figure ----------------
+# ---------------- field computation and plotting ----------------
 
-def fig_toy_four_panels(
+def compute_mode_fields(
     cfg: ToyConfig,
-    X_orig: np.ndarray, Y: np.ndarray,
-    vanilla: MLP, coupled: MLP, ddpm: DDPMTab,
-    out_path: Path,
+    X_train: np.ndarray, vanilla: MLP, coupled: MLP, ddpm: DDPMTab,
     grid_n: int = 160, dc_num_eps: int = 16, dc_t_ref: int = 37,
     seed: int = 0, device: torch.device = torch.device("cpu"),
-) -> None:
-    """Single 1×4-panel figure for one toy mode."""
+) -> dict:
+    """Run the per-pixel field computation for vanilla / coupled / DC.
+
+    Returns dict with grid coordinates and three (grid_n, grid_n) probability
+    fields ``P_v``, ``P_c``, ``P_dc`` (all on the ``P(c=1|x) - 0.5`` scale).
+    """
     A, B, grid_orig = make_xy_grid(grid_n, lim=cfg.axes_lim, device=device)
-    # In the prescaled "training" space (only matters when inv_scale ≠ 1):
     scale_t = torch.tensor(cfg.inv_scale, dtype=torch.float32, device=device)
     grid_train = grid_orig * scale_t
 
-    # ---- vanilla / coupled MLPs evaluated in training space ----
     s_v = np.clip(mlp_grid(vanilla, grid_train), -50, 50)
     s_c = np.clip(mlp_grid(coupled, grid_train), -50, 50)
     P_v = (1.0 / (1.0 + np.exp(-s_v)) - 0.5).reshape(grid_n, grid_n)
     P_c = (1.0 / (1.0 + np.exp(-s_c)) - 0.5).reshape(grid_n, grid_n)
 
-    # ---- diffusion classifier field at t_ref accumulation ----
-    print(f"[fig-toy] computing DC per-pixel errors over T={ddpm.num_steps} steps")
+    print(f"[{cfg.name}] computing DC per-pixel errors over T={ddpm.num_steps} steps")
     err = per_pixel_per_t_errors(ddpm, grid_train, num_eps=dc_num_eps, seed=seed)
     diff = (err[dc_t_ref:, :, 0] - err[dc_t_ref:, :, 1]).sum(dim=0)
     temperature = float(torch.quantile(diff.abs(), 0.90).clamp(min=1e-6))
     P_dc = (torch.sigmoid(diff * (4.0 / temperature)) - 0.5).numpy().reshape(grid_n, grid_n)
 
-    # ---- plot ----
+    return {"A": A, "B": B, "P_v": P_v, "P_c": P_c, "P_dc": P_dc}
+
+
+def _scatter_data(ax, X_orig: np.ndarray, Y: np.ndarray, size: int = 10):
+    ax.scatter(X_orig[Y == 0, 0], X_orig[Y == 0, 1], s=size, c=CLASS_COLORS[0],
+               edgecolors="white", lw=0.3, zorder=4)
+    ax.scatter(X_orig[Y == 1, 0], X_orig[Y == 1, 1], s=size, c=CLASS_COLORS[1],
+               edgecolors="white", lw=0.3, zorder=4)
+
+
+def fig_single_mode(cfg: ToyConfig, X_orig: np.ndarray, Y: np.ndarray,
+                    fields: dict, out_path: Path) -> None:
+    """1×4 figure for a single toy mode."""
+    A, B = fields["A"], fields["B"]
     fig, axes = plt.subplots(1, 4, figsize=(13.0, 3.7), sharey=True,
                              gridspec_kw={"wspace": 0.10})
     cmap = "RdBu_r"; vmax = 0.5
 
-    titles = [
-        "(a)  real signal (human extrapolation)",
-        "(b)  vanilla CE",
-        "(c)  coupled CE  (ours)",
-        "(d)  diffusion classifier",
-    ]
-
-    # (a) real signal — paint via the mode-specific function, then overlay points
-    ax_real = axes[0]
-    cfg.real_signal_fn(ax_real, **cfg.extra_data_args)
-
-    # (b)/(c)/(d) field panels
-    fields = [P_v, P_c, P_dc]
-    for ax, F_ in zip(axes[1:], fields):
+    cfg.real_signal_fn(axes[0], **cfg.extra_data_args)
+    im = None
+    for ax, F_ in zip(axes[1:], (fields["P_v"], fields["P_c"], fields["P_dc"])):
         im = ax.pcolormesh(A, B, F_, shading="auto", cmap=cmap, vmin=-vmax, vmax=vmax)
         ax.contour(A, B, F_, levels=[0.0], colors="k", linewidths=0.9)
 
-    for ax, title in zip(axes, titles):
-        ax.scatter(X_orig[Y == 0, 0], X_orig[Y == 0, 1], s=10, c=CLASS_COLORS[0],
-                   edgecolors="white", lw=0.3, zorder=4)
-        ax.scatter(X_orig[Y == 1, 0], X_orig[Y == 1, 1], s=10, c=CLASS_COLORS[1],
-                   edgecolors="white", lw=0.3, zorder=4)
+    for ax, header in zip(axes, COL_HEADERS):
+        _scatter_data(ax, X_orig, Y, size=10)
         ax.set_xlim(*cfg.axes_lim); ax.set_ylim(*cfg.axes_lim); ax.set_aspect("equal")
         ax.set_xlabel("x")
-        ax.set_title(title)
+        ax.set_title(header)
     axes[0].set_ylabel("y")
 
     cbar = fig.colorbar(im, ax=axes, shrink=0.82, fraction=0.022, pad=0.015)
     cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$")
 
-    fig.suptitle(cfg.title, y=1.03, fontsize=10)
+    fig.suptitle(cfg.single_title, y=1.03, fontsize=10)
+    fig.savefig(out_path)
+    print(f"saved {out_path}")
+    plt.close(fig)
+
+
+def fig_combined_three(results: list[dict], out_path: Path) -> None:
+    """3×4 figure: rows = three toys, columns = ground truth / vanilla / ours / DC."""
+    fig, axes = plt.subplots(3, 4, figsize=(13.0, 9.6),
+                             gridspec_kw={"wspace": 0.08, "hspace": 0.20,
+                                          "left": 0.07, "right": 0.92,
+                                          "top": 0.94, "bottom": 0.04})
+    cmap = "RdBu_r"; vmax = 0.5
+    last_im = None
+
+    for row, res in enumerate(results):
+        cfg = res["cfg"]
+        f = res["fields"]
+        row_axes = axes[row]
+
+        cfg.real_signal_fn(row_axes[0], **cfg.extra_data_args)
+
+        for ax, F_ in zip(row_axes[1:], (f["P_v"], f["P_c"], f["P_dc"])):
+            im = ax.pcolormesh(f["A"], f["B"], F_, shading="auto",
+                               cmap=cmap, vmin=-vmax, vmax=vmax)
+            ax.contour(f["A"], f["B"], F_, levels=[0.0], colors="k", linewidths=0.8)
+            last_im = im
+
+        for ax in row_axes:
+            _scatter_data(ax, res["X_orig"], res["Y"], size=8)
+            ax.set_xlim(*cfg.axes_lim); ax.set_ylim(*cfg.axes_lim)
+            ax.set_aspect("equal")
+            ax.set_xticks([]); ax.set_yticks([])
+
+        # Row label on the far-left panel
+        row_axes[0].set_ylabel(cfg.row_label, fontsize=11, rotation=0,
+                               ha="right", va="center", labelpad=22)
+
+    # Column headers on the top row only
+    for ax, header in zip(axes[0], COL_HEADERS):
+        ax.set_title(header, fontsize=10.5)
+
+    cbar = fig.colorbar(last_im, ax=axes, shrink=0.55, fraction=0.018, pad=0.012)
+    cbar.set_label(r"$P(c\!=\!1\mid x) - 0.5$", fontsize=10)
+
     fig.savefig(out_path)
     print(f"saved {out_path}")
     plt.close(fig)
@@ -568,46 +624,20 @@ def fig_rho_curve(rho_raw: torch.Tensor, rho_clean: torch.Tensor,
 
 # ---------------- main ----------------
 
-def main():
-    parser = ArgumentParser()
-    parser.add_argument("--mode", choices=list(CONFIGS.keys()), required=True,
-                        help="which toy figure to generate")
-    parser.add_argument("--out-dir", type=Path, default=Path("assets"))
-    parser.add_argument("--ckpt-dir", type=Path, default=Path("run/dimpled_paper"))
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--num-points", type=int, default=400)
-    parser.add_argument("--ddpm-epochs", type=int, default=4000)
-    parser.add_argument("--vanilla-epochs", type=int, default=400)
-    parser.add_argument("--coupled-epochs", type=int, default=1500)
-    parser.add_argument("--ddpm-mid", type=int, nargs="+", default=[192, 192, 192, 192])
-    parser.add_argument("--ddpm-embed", type=int, default=192)
-    parser.add_argument("--ddpm-batch", type=int, default=64)
-    parser.add_argument("--num-steps", type=int, default=500)
-    parser.add_argument("--rho-num-eps", type=int, default=6)
-    parser.add_argument("--decisions-grid-n", type=int, default=160)
-    parser.add_argument("--decisions-num-eps", type=int, default=16)
-    parser.add_argument("--decisions-t-ref", type=int, default=37)
-    parser.add_argument("--rho-fig", action="store_true",
-                        help="also write the ρ-curve auxiliary figure")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--retrain", action="store_true",
-                        help="delete cached artifacts before running")
-    args = parser.parse_args()
+def run_one_mode(mode: str, args, device: torch.device) -> dict:
+    """Train (or load) all components for one toy and compute its three field grids.
 
-    cfg = CONFIGS[args.mode]
-    device = _resolve_device(args.device)
-    print(f"[device] {device}  (accelerator={_accelerator_for(device)})")
-
-    seed_everything(args.seed)
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    mode_ckpt_dir = args.ckpt_dir / args.mode
+    Returns ``{cfg, X_orig, Y, fields, rho_raw, rho_clean, ddpm}``.
+    """
+    cfg = CONFIGS[mode]
+    mode_ckpt_dir = args.ckpt_dir / mode
     mode_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     if args.retrain:
         for f in mode_ckpt_dir.glob("*"):
             print(f"[clean] removing {f}"); f.unlink()
 
-    print(f"[data] generating  ({args.mode})")
+    print(f"[data] generating  ({mode})")
     X_orig, Y = cfg.data_fn(num_points=args.num_points, seed=args.seed,
                             **cfg.extra_data_args)
     X_train = apply_scale(X_orig, cfg.inv_scale)
@@ -645,18 +675,69 @@ def main():
                                     epochs=args.coupled_epochs,
                                     seed=args.seed, device=device)
 
-    print("[fig] rendering")
-    fig_path = args.out_dir / f"fig_{args.mode}_toy.pdf"
-    fig_toy_four_panels(
-        cfg, X_orig, Y, vanilla, coupled, ddpm, fig_path,
+    fields = compute_mode_fields(
+        cfg, X_train, vanilla, coupled, ddpm,
         grid_n=args.decisions_grid_n, dc_num_eps=args.decisions_num_eps,
         dc_t_ref=args.decisions_t_ref, seed=args.seed, device=device,
     )
 
-    if args.rho_fig:
-        rho_fig_path = args.out_dir / f"fig_{args.mode}_rho.pdf"
-        fig_rho_curve(rho_raw, rho_clean, ddpm, X_train, Y, rho_fig_path,
-                      axes_lim=cfg.axes_lim, seed=args.seed, device=device)
+    return {
+        "cfg": cfg, "X_orig": X_orig, "Y": Y, "fields": fields,
+        "rho_raw": rho_raw, "rho_clean": rho_clean, "ddpm": ddpm,
+        "X_train": X_train,
+    }
+
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument("--mode", choices=list(CONFIGS.keys()) + ["all"], required=True,
+                        help="which toy figure(s) to generate; 'all' renders the 3×4 combined figure")
+    parser.add_argument("--out-dir", type=Path, default=Path("assets"))
+    parser.add_argument("--ckpt-dir", type=Path, default=Path("run/dimpled_paper"))
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--num-points", type=int, default=400)
+    parser.add_argument("--ddpm-epochs", type=int, default=4000)
+    parser.add_argument("--vanilla-epochs", type=int, default=400)
+    parser.add_argument("--coupled-epochs", type=int, default=1500)
+    parser.add_argument("--ddpm-mid", type=int, nargs="+", default=[192, 192, 192, 192])
+    parser.add_argument("--ddpm-embed", type=int, default=192)
+    parser.add_argument("--ddpm-batch", type=int, default=64)
+    parser.add_argument("--num-steps", type=int, default=500)
+    parser.add_argument("--rho-num-eps", type=int, default=6)
+    parser.add_argument("--decisions-grid-n", type=int, default=160)
+    parser.add_argument("--decisions-num-eps", type=int, default=16)
+    parser.add_argument("--decisions-t-ref", type=int, default=37)
+    parser.add_argument("--rho-fig", action="store_true",
+                        help="also write the ρ-curve auxiliary figure (per mode)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--retrain", action="store_true",
+                        help="delete cached artifacts before running")
+    args = parser.parse_args()
+
+    device = _resolve_device(args.device)
+    print(f"[device] {device}  (accelerator={_accelerator_for(device)})")
+
+    seed_everything(args.seed)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    modes = list(CONFIGS.keys()) if args.mode == "all" else [args.mode]
+    results = []
+    for m in modes:
+        print(f"\n========== {m.upper()} ==========")
+        res = run_one_mode(m, args, device)
+        results.append(res)
+        # Always save the single-mode 1×4 PDF too
+        single_path = args.out_dir / f"fig_{m}_toy.pdf"
+        fig_single_mode(res["cfg"], res["X_orig"], res["Y"], res["fields"], single_path)
+        if args.rho_fig:
+            rho_fig_path = args.out_dir / f"fig_{m}_rho.pdf"
+            fig_rho_curve(res["rho_raw"], res["rho_clean"], res["ddpm"],
+                          res["X_train"], res["Y"], rho_fig_path,
+                          axes_lim=res["cfg"].axes_lim, seed=args.seed, device=device)
+
+    if args.mode == "all":
+        combined_path = args.out_dir / "fig_three_toys.pdf"
+        fig_combined_three(results, combined_path)
 
 
 if __name__ == "__main__":
