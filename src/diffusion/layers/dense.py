@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from .embed import LearnableSinusoidalEncoding
+from .embed import LearnableSinusoidalEncoding, ClassEmbedding
 from .utils import make_activation
 
 
@@ -16,6 +16,7 @@ class CondDense(nn.Module):
         out_features: int,
         activation: str | None = "leaky_relu",
         embed_dim: int | None = None,
+        num_classes: int | None = None,
     ):
         super().__init__()
 
@@ -35,7 +36,18 @@ class CondDense(nn.Module):
         else:
             self.emb = None
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor | None = None) -> torch.Tensor:
+        # create lookup table class embedding
+        if num_classes is not None:
+            self.class_embed = ClassEmbedding(num_classes, out_features)
+        else:
+            self.class_embed = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor | None = None,
+        cids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         out = self.linear(x)
 
         # add positional embedding (conditioning)
@@ -46,6 +58,15 @@ class CondDense(nn.Module):
             raise TypeError("No temporal embedding")
         elif t is None and self.emb is not None:
             raise TypeError("No time passed")
+
+        # add class embedding
+        if cids is not None and self.class_embed is not None:
+            c_emb = self.class_embed(cids)
+            out = out + c_emb
+        elif cids is not None and self.class_embed is None:
+            raise TypeError("No class embedding")
+        elif cids is None and self.class_embed is not None:
+            raise TypeError("No class label passed")
 
         if self.activation is not None:
             out = self.activation(out)

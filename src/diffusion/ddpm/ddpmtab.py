@@ -26,6 +26,8 @@ class DDPMTab(DDPM):
         Nonlinearity type.
     embed_dim : int
         Dimension of the time embedding.
+    num_classes : int or None
+        Number of classes (for conditioning).
     num_steps : int
         Number of time steps.
     schedule : str
@@ -56,6 +58,7 @@ class DDPMTab(DDPM):
         mid_features: Sequence[int] = (128, 128, 128),
         activation: str | None = "leaky_relu",
         embed_dim: int = 128,
+        num_classes: int | None = None,
         num_steps: int = 500,
         schedule: str = "cosine",
         beta_range: tuple[float, float] = (1e-04, 0.02),
@@ -75,6 +78,7 @@ class DDPMTab(DDPM):
             num_features=num_features,
             activation=activation,
             embed_dim=embed_dim,
+            num_classes=num_classes,
         )
 
         # create noise schedule

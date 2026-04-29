@@ -16,6 +16,7 @@ class CondDenseModel(nn.Module):
         num_features: Sequence[int],
         activation: str | None = "leaky_relu",
         embed_dim: int | None = None,
+        num_classes: int | None = None,
     ):
         super().__init__()
 
@@ -34,6 +35,7 @@ class CondDenseModel(nn.Module):
                 out_features,
                 activation=activation if is_not_last else None,  # set activation for all layers except the last
                 embed_dim=embed_dim,  # set time embedding for all layers
+                num_classes=num_classes,  # set class embedding for all layers
             )
 
             dense_list.append(dense)
@@ -46,11 +48,7 @@ class CondDenseModel(nn.Module):
         t: torch.Tensor,
         cids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-
-        if cids is not None:
-            raise NotImplementedError("Class conditioning is not implemented")
-
         for dense in self.dense_layers:
-            x = dense(x, t)
+            x = dense(x, t, cids=cids)
 
         return x

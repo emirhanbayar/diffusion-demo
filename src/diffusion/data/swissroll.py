@@ -14,7 +14,8 @@ def make_swiss_roll_2d(
     scaling: float = 0.15,
     random_state: int | None = None,
     test_size: float | int | None = None,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    num_bands: int | None = None,
+) -> np.ndarray | tuple[np.ndarray, ...]:
     """
     Create 2D Swiss roll data.
 
@@ -30,11 +31,14 @@ def make_swiss_roll_2d(
         Random generator seed.
     test_size : float, int or None
         Test size parameter.
+    num_bands : int or None
+        If given, splits the spiral into this many concentric bands
+        and assigns each sample a class label by alternating 0/1.
 
     """
 
     # create 3D data
-    x, _ = make_swiss_roll(num_samples, noise=abs(noise_level), random_state=random_state)
+    x, t = make_swiss_roll(num_samples, noise=abs(noise_level), random_state=random_state)
 
     # restrict to 2D
     x = x[:, [0, 2]]
@@ -42,15 +46,29 @@ def make_swiss_roll_2d(
     # scale data
     x = scaling * x
 
+    # build band labels along the spiral parameter t
+    if num_bands is not None:
+        num_bands = abs(int(num_bands))
+        if num_bands < 1:
+            raise ValueError("num_bands must be at least 1")
+        edges = np.linspace(t.min(), t.max(), num_bands + 1)
+        band_idx = np.clip(np.digitize(t, edges) - 1, 0, num_bands - 1)
+        y = (band_idx % 2).astype(np.int64)
+
     # return
     if test_size is None:
-        return x
+        if num_bands is None:
+            return x
+        return x, y
 
     # split data and return
     else:
-        x_train, x_val = train_test_split(x, test_size=test_size)
-
-        return x_train, x_val
+        if num_bands is None:
+            x_train, x_val = train_test_split(x, test_size=test_size)
+            return x_train, x_val
+        else:
+            x_train, x_val, y_train, y_val = train_test_split(x, y, test_size=test_size)
+            return x_train, x_val, y_train, y_val
 
 
 class SwissRollDataModule(LightningDataModule):
@@ -88,6 +106,7 @@ class SwissRollDataModule(LightningDataModule):
         random_state: int = 42,
         batch_size: int = 32,
         num_workers: int = 0,
+        num_bands: int | None = None,
     ):
         super().__init__()
 
@@ -97,6 +116,7 @@ class SwissRollDataModule(LightningDataModule):
         self.num_test = abs(int(num_test))
         self.noise_level = abs(noise_level)
         self.scaling = scaling
+        self.num_bands = None if num_bands is None else abs(int(num_bands))
 
         # set random state
         self.random_state = random_state
@@ -111,13 +131,21 @@ class SwissRollDataModule(LightningDataModule):
         # create data
         num_samples = self.num_train + self.num_val + self.num_test
 
-        x = make_swiss_roll_2d(
+        out = make_swiss_roll_2d(
             num_samples,
             noise_level=self.noise_level,
             scaling=self.scaling,
             random_state=self.random_state,
             test_size=None,
+            num_bands=self.num_bands,
         )
+
+        if self.num_bands is None:
+            x = out
+            self.y = None
+        else:
+            x, y = out
+            self.y = torch.tensor(y, dtype=torch.long)
 
         # transform to tensor
         self.x = torch.tensor(x, dtype=torch.float32)
@@ -134,17 +162,32 @@ class SwissRollDataModule(LightningDataModule):
     def x_test(self) -> torch.Tensor:
         return self.x[self.num_train + self.num_val :]
 
+    @property
+    def y_train(self) -> torch.Tensor | None:
+        return None if self.y is None else self.y[: self.num_train]
+
+    @property
+    def y_val(self) -> torch.Tensor | None:
+        return None if self.y is None else self.y[self.num_train : self.num_train + self.num_val]
+
+    @property
+    def y_test(self) -> torch.Tensor | None:
+        return None if self.y is None else self.y[self.num_train + self.num_val :]
+
+    def _make_dataset(self, x: torch.Tensor, y: torch.Tensor | None) -> TensorDataset:
+        return TensorDataset(x) if y is None else TensorDataset(x, y)
+
     def setup(self, stage: str):
         """Set up train/test/val. datasets."""
 
         # create train/val. datasets
         if stage in ("fit", "validate"):
-            self.train_set = TensorDataset(self.x_train)
-            self.val_set = TensorDataset(self.x_val)
+            self.train_set = self._make_dataset(self.x_train, self.y_train)
+            self.val_set = self._make_dataset(self.x_val, self.y_val)
 
         # create test dataset
         elif stage == "test":
-            self.test_set = TensorDataset(self.x_test)
+            self.test_set = self._make_dataset(self.x_test, self.y_test)
 
     def train_dataloader(self) -> DataLoader:
         """Create train dataloader."""
