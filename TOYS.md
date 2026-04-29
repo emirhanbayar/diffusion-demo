@@ -50,25 +50,26 @@ how different training procedures shape that extrapolation.
 The user-facing data is 2D so we can plot it. The narrative is that `y`
 *represents* a 3000-D off-manifold direction and `x` *represents* a 20-D
 on-manifold direction. We honour that narrative in the noise injection: the
-forward process should add Gaussian noise with std `σ·√D` per axis, so
-
-```
-σ_x = σ · √20    ≈ 4.47 σ
-σ_y = σ · √3000  ≈ 54.77 σ
-```
+forward process should add Gaussian noise whose anisotropy ratio matches the
+ambient-dimension ratio, `σ_y / σ_x = √(D_y / D_x) ≈ 12.25`.
 
 Rather than modify the DDPM core to support per-axis noise, we **prescale the
-data** so isotropic noise in the prescaled coordinate matches the desired
-anisotropic noise in the original coordinate. With
+data** so isotropic noise in the prescaled coordinate becomes anisotropic in
+original coordinates with the right ratio:
 
 ```
-inv_scale = (1/√20, 1/√3000)
-x' = x · 1/√20,    y' = y · 1/√3000
+inv_scale = (1, √(D_x / D_y)) ≈ (1, 0.0816)
+x' = x,    y' = y · 0.0816
 ```
 
-an isotropic noise of std `σ` in `(x', y')` corresponds to `σ·√20` in `x` and
-`σ·√3000` in `y` after the inverse map — exactly what the off-manifold story
-asks for. All training (DDPM, vanilla, coupled) happens in the prescaled
+An isotropic noise of std `σ` on `(x', y')` corresponds to `(σ, 12.25 σ)` on
+`(x, y)` after the inverse map — exactly the anisotropy ratio asked for. We
+intentionally keep `x` at its natural scale 1 so the DDPM operates on data of
+magnitude `~1` (matched to the cosine schedule's noise scale); a literal
+`(1/√20, 1/√3000)` prescale would have crushed the data to magnitude `~0.018`
+and the DDPM's noise schedule would have dominated the signal at every `t`.
+
+All training (DDPM, vanilla, ρ=1 noise-aug, coupled) happens in the prescaled
 coordinate; the visualisation grid is built in the original `(x, y)` space and
 prescaled before being passed to the models.
 

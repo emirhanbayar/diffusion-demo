@@ -246,16 +246,19 @@ CONFIGS = {
         row_label="Adversarial\nrobustness",
         single_title=(
             "Adversarial robustness: 1D points in 2D — "
-            "$\\sigma_x{=}\\sigma\\sqrt{20}$, $\\sigma_y{=}\\sigma\\sqrt{3000}$"
+            "$\\sigma_y/\\sigma_x = \\sqrt{D_y/D_x} \\approx 12.25$"
         ),
         data_fn=make_adversarial,
         real_signal_fn=None,
-        # (1/√D_x, 1/√D_y): noise σ in the prescaled space ⇒ σ·√D in original space
-        inv_scale=(1.0 / float(np.sqrt(D_X_ADV)), 1.0 / float(np.sqrt(D_Y_ADV))),
+        # Keep x at its natural scale 1; only shrink y by sqrt(D_x/D_y) so the
+        # DDPM's isotropic noise σ becomes (σ on x, 12.25σ on y) in original
+        # space — same anisotropy ratio as σ·√D scaling but the DDPM operates
+        # on data of magnitude ~1 instead of ~0.018.
+        inv_scale=(1.0, float(np.sqrt(D_X_ADV / D_Y_ADV))),
         column_kinds=_KINDS_ADV,
         column_headers=_HEADERS_ADV,
-        axes_lim=(-2.5, 2.5),
-        extra_data_args={"n_unique": 7, "axis_lim": (-1.0, 1.0), "jitter": 0.005},
+        axes_lim=(-1.0, 1.0),
+        extra_data_args={"n_unique": 25, "axis_lim": (-0.96, 0.96), "jitter": 0.005},
     ),
 }
 
