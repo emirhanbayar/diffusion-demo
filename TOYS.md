@@ -45,35 +45,27 @@ because the adversarial-robustness story is precisely about the
 classifier paints its own reasonable extrapolation, and the four panels show
 how different training procedures shape that extrapolation.
 
-## How the adversarial mode encodes the high-dim story
+## How the adversarial mode is implemented
 
-The user-facing data is 2D so we can plot it. The narrative is that `y`
-*represents* a 3000-D off-manifold direction and `x` *represents* a 20-D
-on-manifold direction. We honour that narrative in the noise injection: the
-forward process should add Gaussian noise whose anisotropy ratio matches the
-ambient-dimension ratio, `σ_y / σ_x = √(D_y / D_x) ≈ 12.25`.
+The adversarial-robustness toy is implemented separately from `stripes` and
+`chess` — it does **not** use a DDPM. The components are ported from the
+`/home/emirhan/off-manifold-noise-augment` codebase:
 
-Rather than modify the DDPM core to support per-axis noise, we **prescale the
-data** so isotropic noise in the prescaled coordinate becomes anisotropic in
-original coordinates with the right ratio:
+- **PaperClassifier** — the 2-layer ReLU width-4000 classifier of Melamed et
+  al. 2023 (random ±1 second-layer init, full-batch SGD, BCE). Its dimpled-
+  manifold inductive bias is what makes the no-augmentation panel show the
+  characteristic "boundary clings to the data line" pattern; a generic MLP +
+  Adam smooths that out.
+- **Anisotropic noise sampler** — for each step, `σ ~ Uniform[σ_min, σ_max]`
+  (defaults `[0.001, 0.020]`), then the per-axis noise std is `σ·√D_axis`
+  with `D_x = 20` (on-manifold) and `D_y = 3000` (off-manifold).
+- **ρ(σ)** — computed analytically from the data's KDE-mixture posterior by
+  Monte-Carlo over noised samples (`estimate_rho_kde`).
+- **KDE classifier** — Gaussian KDE per class with anisotropic bandwidth
+  `σ·√D_axis`, plus a uniform mixture floor so the posterior fades to 0.5
+  off-manifold (matches `run_diffusion_classifier.py` in the source codebase).
 
-```
-inv_scale = (1, √(D_x / D_y)) ≈ (1, 0.0816)
-x' = x,    y' = y · 0.0816
-```
-
-An isotropic noise of std `σ` on `(x', y')` corresponds to `(σ, 12.25 σ)` on
-`(x, y)` after the inverse map — exactly the anisotropy ratio asked for. We
-intentionally keep `x` at its natural scale 1 so the DDPM operates on data of
-magnitude `~1` (matched to the cosine schedule's noise scale); a literal
-`(1/√20, 1/√3000)` prescale would have crushed the data to magnitude `~0.018`
-and the DDPM's noise schedule would have dominated the signal at every `t`.
-
-All training (DDPM, vanilla, ρ=1 noise-aug, coupled) happens in the prescaled
-coordinate; the visualisation grid is built in the original `(x, y)` space and
-prescaled before being passed to the models.
-
-For `stripes` and `chess`, `inv_scale = (1, 1)` and the prescale is a no-op.
+Stripes and chess modes still use the DDPM + MLP pipeline unchanged.
 
 ## Running
 

@@ -26,6 +26,7 @@ Lightning trainer also picks up GPUs automatically.
 
 from __future__ import annotations
 
+import math
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
+from torch import optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from diffusion import DDPMTab
@@ -485,6 +487,239 @@ def train_or_load_noise_aug(X, Y, ddpm: DDPMTab, rho: torch.Tensor, out_dir: Pat
     return m.eval().to(device)
 
 
+# ---------------- adversarial-mode (off-manifold-noise-augment style) ----------------
+#
+# This block reproduces the relevant pieces of /home/emirhan/off-manifold-noise-augment
+# for the 1D-on-2D adversarial-robustness toy:
+#
+#   * PaperClassifier — the 2-layer ReLU width-4000 net of Melamed et al. 2023
+#     (random ±1 second-layer init, SGD, BCE) — its dimpled-manifold inductive
+#     bias is what gives the "vanilla CE clings to the manifold" panel its
+#     characteristic look. Our generic MLP+Adam does NOT reproduce that.
+#
+#   * sample_aniso_noise — σ ~ Uniform[σ_min, σ_max] then per-axis std σ·√D_axis
+#     using D_X=20 (on-manifold) and D_Y=3000 (off-manifold).
+#
+#   * KDEClassifier — class-conditional Gaussian KDE with anisotropic bandwidth
+#     σ·√D_axis. Used as the "diffusion classifier" panel for the adversarial
+#     toy, exactly like run_diffusion_classifier.py in that codebase.
+#
+#   * estimate_rho_kde — ρ(σ) = I(c; x_σ) / log 2, computed analytically from
+#     the KDE marginal via Monte-Carlo over noised samples.
+
+class PaperClassifier(nn.Module):
+    """Two-layer ReLU classifier from Melamed et al. 2023, Appendix C / Fig. 3a."""
+    def __init__(self, in_features: int = 2, width: int = 4000, seed: int = 0):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, width, bias=True)
+        self.fc_final = nn.Linear(width, 1, bias=True)
+        g = torch.Generator().manual_seed(seed)
+        with torch.no_grad():
+            self.fc1.weight.copy_(torch.randn(self.fc1.weight.shape, generator=g)
+                                  * math.sqrt(1.0 / in_features))
+            self.fc1.bias.zero_()
+            signs = torch.randint(0, 2, self.fc_final.weight.shape, generator=g).float() * 2 - 1
+            self.fc_final.weight.copy_(signs)
+            self.fc_final.bias.zero_()
+
+    def forward_logit(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc_final(torch.relu(self.fc1(x))).squeeze(-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Two-class logits compatible with the ``mlp_grid`` helper.
+        l = self.forward_logit(x)
+        return torch.stack([-0.5 * l, 0.5 * l], dim=-1)
+
+
+def _aniso_scale(D_per_axis: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    return torch.tensor([math.sqrt(d) for d in D_per_axis],
+                        dtype=torch.float32, device=device).view(1, -1)
+
+
+def sample_aniso_noise(shape: tuple[int, int], sigma: torch.Tensor,
+                       D_per_axis: tuple[int, ...],
+                       generator: torch.Generator | None = None,
+                       device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    """noise[i, k] = sigma[i] * eps[i, k] * √D_per_axis[k]."""
+    eps = torch.randn(shape, device=device, generator=generator)
+    return sigma * eps * _aniso_scale(D_per_axis, device)
+
+
+def train_paper_vanilla(X: np.ndarray, Y: np.ndarray, out_dir: Path,
+                        epochs: int = 30000, lr: float = 0.002,
+                        seed: int = 0,
+                        device: torch.device = torch.device("cpu")) -> PaperClassifier:
+    """PaperClassifier trained with full-batch SGD on clean (x, y) inputs."""
+    ckpt = out_dir / "paper_vanilla.pt"
+    if ckpt.exists():
+        m = PaperClassifier(in_features=2, seed=seed)
+        m.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        return m.eval().to(device)
+    torch.manual_seed(seed)
+    data = torch.tensor(X, dtype=torch.float32, device=device)
+    target = torch.tensor(Y, dtype=torch.float32, device=device)
+    m = PaperClassifier(in_features=2, seed=seed).to(device)
+    opt = optim.SGD(m.parameters(), lr=lr)
+    for ep in range(epochs):
+        opt.zero_grad()
+        logits = m.forward_logit(data)
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+        loss.backward(); opt.step()
+        if (ep + 1) % 5000 == 0:
+            print(f"  paper-vanilla ep {ep + 1:>5}  BCE {float(loss.detach()):.4f}")
+    torch.save(m.state_dict(), ckpt)
+    return m.eval().to(device)
+
+
+def train_paper_noise_aug(X, Y, out_dir: Path, D_per_axis: tuple[int, ...],
+                          sigma_min: float = 0.001, sigma_max: float = 0.02,
+                          epochs: int = 60000, lr: float = 0.002,
+                          seed: int = 0,
+                          device: torch.device = torch.device("cpu")) -> PaperClassifier:
+    """PaperClassifier with σ-uniform noise augmentation and *sharp* labels."""
+    ckpt = out_dir / "paper_noise_aug.pt"
+    if ckpt.exists():
+        m = PaperClassifier(in_features=2, seed=seed)
+        m.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        return m.eval().to(device)
+    torch.manual_seed(seed)
+    data = torch.tensor(X, dtype=torch.float32, device=device)
+    target = torch.tensor(Y, dtype=torch.float32, device=device)
+    m = PaperClassifier(in_features=2, seed=seed).to(device)
+    opt = optim.SGD(m.parameters(), lr=lr)
+    g = torch.Generator(device=device).manual_seed(seed + 1)
+    for ep in range(epochs):
+        opt.zero_grad()
+        n = data.shape[0]
+        sigma = sigma_min + (sigma_max - sigma_min) * torch.rand(
+            (n, 1), device=device, generator=g)
+        noise = sample_aniso_noise(data.shape, sigma, D_per_axis,
+                                   generator=g, device=device)
+        x_in = data + noise
+        logits = m.forward_logit(x_in)
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+        loss.backward(); opt.step()
+        if (ep + 1) % 10000 == 0:
+            print(f"  paper-noise-aug ep {ep + 1:>5}  BCE {float(loss.detach()):.4f}")
+    torch.save(m.state_dict(), ckpt)
+    return m.eval().to(device)
+
+
+def train_paper_coupled(X, Y, out_dir: Path,
+                        sigma_levels: torch.Tensor, rho_levels: torch.Tensor,
+                        D_per_axis: tuple[int, ...],
+                        epochs: int = 60000, lr: float = 0.002, seed: int = 0,
+                        device: torch.device = torch.device("cpu")) -> PaperClassifier:
+    """PaperClassifier with matched-ρ soft labels under the discrete σ schedule.
+
+    t ~ q(t) ∝ |Δρ(σ_t)|;  c_t = ρ·c + (1-ρ)·0.5;  BCE(logit, c_t)."""
+    ckpt = out_dir / "paper_coupled.pt"
+    if ckpt.exists():
+        m = PaperClassifier(in_features=2, seed=seed)
+        m.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        return m.eval().to(device)
+    torch.manual_seed(seed)
+    data = torch.tensor(X, dtype=torch.float32, device=device)
+    target = torch.tensor(Y, dtype=torch.float32, device=device)
+    m = PaperClassifier(in_features=2, seed=seed).to(device)
+    opt = optim.SGD(m.parameters(), lr=lr)
+
+    # |Δρ| over consecutive σ-levels, padded with a 0 so the index range is K
+    drho = (rho_levels[:-1] - rho_levels[1:]).abs().clamp(min=1e-9)
+    drho = torch.cat([drho, drho[-1:]])
+    q = (drho / drho.sum()).double().to(device)
+    t_dist = torch.distributions.Categorical(probs=q)
+    sigma_levels = sigma_levels.to(device)
+    rho_levels = rho_levels.to(device)
+    g = torch.Generator(device=device).manual_seed(seed + 2)
+    for ep in range(epochs):
+        opt.zero_grad()
+        n = data.shape[0]
+        tids = t_dist.sample((n,))
+        sigma = sigma_levels[tids].view(-1, 1)
+        noise = sample_aniso_noise(data.shape, sigma, D_per_axis,
+                                   generator=g, device=device)
+        x_in = data + noise
+        rho = rho_levels[tids]
+        target_soft = rho * target + (1 - rho) * 0.5
+        logits = m.forward_logit(x_in)
+        loss = F.binary_cross_entropy_with_logits(logits, target_soft)
+        loss.backward(); opt.step()
+        if (ep + 1) % 10000 == 0:
+            print(f"  paper-coupled ep {ep + 1:>5}  BCE {float(loss.detach()):.4f}")
+    torch.save(m.state_dict(), ckpt)
+    return m.eval().to(device)
+
+
+@torch.no_grad()
+def kde_p_class1(grid_xy: torch.Tensor, x0: torch.Tensor, c0: torch.Tensor,
+                 sigma: float, D_per_axis: tuple[int, ...],
+                 alpha: float = 0.0) -> torch.Tensor:
+    """Posterior P(c=1 | x) under the anisotropic-bandwidth Gaussian KDE."""
+    device = grid_xy.device
+    var = torch.tensor([(sigma ** 2) * d for d in D_per_axis],
+                       dtype=torch.float32, device=device)
+    inv_var = (1.0 / var).view(1, 1, -1)
+    diff = grid_xy.unsqueeze(1) - x0.unsqueeze(0)
+    log_kern = -0.5 * (diff ** 2 * inv_var).sum(dim=-1)        # (B, N)
+    logs = []
+    for c_val in (0, 1):
+        mask = (c0 == c_val)
+        n_c = int(mask.sum().item())
+        if n_c == 0:
+            logs.append(torch.full((grid_xy.shape[0],), float("-inf"), device=device))
+        else:
+            logs.append(torch.logsumexp(log_kern[:, mask], dim=-1) - math.log(n_c))
+    log_p = torch.stack(logs, dim=-1)
+    if alpha > 0.0:
+        log_term_kde = log_p + math.log(1.0 - alpha)
+        log_term_bg = math.log(alpha)
+        log_p = torch.logaddexp(log_term_kde, torch.full_like(log_term_kde, log_term_bg))
+    log_post = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
+    p = log_post.exp()
+    return p[:, 1]
+
+
+@torch.no_grad()
+def estimate_rho_kde(x0: torch.Tensor, c0: torch.Tensor,
+                     sigma_levels: torch.Tensor,
+                     D_per_axis: tuple[int, ...],
+                     num_samples: int = 8000, seed: int = 0) -> torch.Tensor:
+    """ρ(σ_k) = I(c; x_σ) / log 2 estimated by Monte-Carlo on the KDE mixture."""
+    device = x0.device
+    g = torch.Generator(device=device).manual_seed(seed)
+    n = x0.shape[0]
+    rhos = []
+    for sigma in sigma_levels.tolist():
+        idx = torch.randint(0, n, (num_samples,), device=device, generator=g)
+        centers = x0[idx]
+        if sigma > 0:
+            noise = sample_aniso_noise(centers.shape,
+                                       torch.full((num_samples, 1), float(sigma), device=device),
+                                       D_per_axis, generator=g, device=device)
+        else:
+            noise = torch.zeros_like(centers)
+        x_sigma = centers + noise
+        # p(c|x_σ) at σ_eval = sigma; use a tiny floor sigma at σ=0 to avoid Inf
+        sigma_eval = max(float(sigma), 1e-6)
+        p1 = kde_p_class1(x_sigma, x0, c0, sigma_eval, D_per_axis, alpha=0.0)
+        p1 = p1.clamp(1e-6, 1.0 - 1e-6)
+        kl = p1 * (p1.log() - math.log(0.5)) + (1 - p1) * ((1 - p1).log() - math.log(0.5))
+        rhos.append(kl.mean().item())
+    rho = torch.tensor(rhos)
+    return (rho / rho[0].clamp(min=1e-9)).clamp(0.0, 1.0)
+
+
+def adversarial_dc_field(grid_orig: torch.Tensor, x0: torch.Tensor, c0: torch.Tensor,
+                         sigma: float, D_per_axis: tuple[int, ...],
+                         alpha_floor: float = 0.01) -> np.ndarray:
+    """The off-manifold-noise-augment "diffusion classifier" — anisotropic-KDE
+    posterior with a uniform mixture floor (matches run_diffusion_classifier.py).
+    Returns ``P(c=1|x) - 0.5``."""
+    p1 = kde_p_class1(grid_orig, x0, c0, sigma, D_per_axis, alpha=alpha_floor)
+    return (p1 - 0.5).cpu().numpy()
+
+
 # ---------------- field helpers ----------------
 
 @torch.no_grad()
@@ -711,6 +946,92 @@ def fig_rho_curve(rho_raw: torch.Tensor, rho_clean: torch.Tensor,
 
 # ---------------- main ----------------
 
+def run_adversarial_mode(args, device: torch.device) -> dict:
+    """Adversarial toy: PaperClassifier + off-manifold-noise scheme + KDE DC.
+
+    Replaces the DDPMTab+MLP pipeline with the exact components from
+    /home/emirhan/off-manifold-noise-augment so the vanilla panel exhibits
+    the dimpled-manifold behaviour the user wants.
+    """
+    cfg = CONFIGS["adversarial"]
+    mode_ckpt_dir = args.ckpt_dir / "adversarial"
+    mode_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if args.retrain:
+        for f in mode_ckpt_dir.glob("*"):
+            print(f"[clean] removing {f}"); f.unlink()
+
+    print("[data] generating  (adversarial)")
+    X_orig, Y = cfg.data_fn(num_points=args.num_points, seed=args.seed,
+                            **cfg.extra_data_args)
+    # No prescaling for adversarial: noise is anisotropic by construction.
+    x0_t = torch.tensor(X_orig, dtype=torch.float32, device=device)
+    c0_t = torch.tensor(Y, dtype=torch.long, device=device)
+
+    sigma_min = args.adv_sigma_min
+    sigma_max = args.adv_sigma_max
+    sigma_levels = torch.linspace(sigma_min, sigma_max, args.adv_n_sigma_levels)
+    D_per_axis = (D_X_ADV, D_Y_ADV)
+
+    rho_path = mode_ckpt_dir / "rho.pt"
+    if rho_path.exists():
+        print(f"[rho] loading {rho_path}")
+        d = torch.load(rho_path, weights_only=True)
+        rho_levels = d["rho"]
+    else:
+        print("[rho] estimating (KDE-based)")
+        rho_levels = estimate_rho_kde(x0_t, c0_t, sigma_levels.to(device),
+                                      D_per_axis, num_samples=8000, seed=args.seed)
+        for i in range(1, len(rho_levels)):
+            rho_levels[i] = min(rho_levels[i], rho_levels[i - 1])
+        torch.save({"rho": rho_levels, "sigma": sigma_levels}, rho_path)
+
+    print("[paper] vanilla")
+    vanilla = train_paper_vanilla(X_orig, Y, mode_ckpt_dir,
+                                  epochs=args.adv_paper_epochs,
+                                  lr=args.adv_paper_lr,
+                                  seed=args.seed, device=device)
+    print("[paper] noise-aug (sharp labels  =  adversarial training)")
+    noise_aug = train_paper_noise_aug(X_orig, Y, mode_ckpt_dir, D_per_axis=D_per_axis,
+                                      sigma_min=sigma_min, sigma_max=sigma_max,
+                                      epochs=args.adv_paper_aug_epochs,
+                                      lr=args.adv_paper_lr,
+                                      seed=args.seed, device=device)
+    print("[paper] coupled (matched-ρ soft labels)")
+    coupled = train_paper_coupled(X_orig, Y, mode_ckpt_dir,
+                                  sigma_levels=sigma_levels.to(device),
+                                  rho_levels=rho_levels.to(device),
+                                  D_per_axis=D_per_axis,
+                                  epochs=args.adv_paper_aug_epochs,
+                                  lr=args.adv_paper_lr,
+                                  seed=args.seed, device=device)
+
+    A, B, grid_orig = make_xy_grid(args.decisions_grid_n, lim=cfg.axes_lim, device=device)
+
+    s_v = np.clip(mlp_grid(vanilla, grid_orig), -50, 50)
+    s_na = np.clip(mlp_grid(noise_aug, grid_orig), -50, 50)
+    s_c = np.clip(mlp_grid(coupled, grid_orig), -50, 50)
+    g_n = args.decisions_grid_n
+    P_v = (1.0 / (1.0 + np.exp(-s_v)) - 0.5).reshape(g_n, g_n)
+    P_na = (1.0 / (1.0 + np.exp(-s_na)) - 0.5).reshape(g_n, g_n)
+    P_c = (1.0 / (1.0 + np.exp(-s_c)) - 0.5).reshape(g_n, g_n)
+
+    print(f"[KDE] computing DC field at σ = {args.adv_kde_sigma}")
+    P_dc = adversarial_dc_field(grid_orig, x0_t, c0_t,
+                                sigma=args.adv_kde_sigma,
+                                D_per_axis=D_per_axis,
+                                alpha_floor=args.adv_kde_alpha).reshape(g_n, g_n)
+
+    fields = {"A": A, "B": B,
+              "P_vanilla": P_v, "P_noise_aug": P_na,
+              "P_coupled": P_c, "P_dc": P_dc}
+
+    return {
+        "cfg": cfg, "X_orig": X_orig, "Y": Y, "fields": fields,
+        "rho_raw": rho_levels, "rho_clean": rho_levels,
+        "ddpm": None, "X_train": X_orig,
+    }
+
+
 def run_one_mode(mode: str, args, device: torch.device) -> dict:
     """Train (or load) all components for one toy and compute its three field grids.
 
@@ -803,6 +1124,22 @@ def main():
     parser.add_argument("--decisions-grid-n", type=int, default=160)
     parser.add_argument("--decisions-num-eps", type=int, default=16)
     parser.add_argument("--decisions-t-ref", type=int, default=37)
+    # ----- adversarial-mode (off-manifold-noise-augment) -----
+    parser.add_argument("--adv-sigma-min", type=float, default=0.001)
+    parser.add_argument("--adv-sigma-max", type=float, default=0.020)
+    parser.add_argument("--adv-n-sigma-levels", type=int, default=20)
+    parser.add_argument("--adv-paper-epochs", type=int, default=30000,
+                        help="full-batch SGD steps for the no-aug PaperClassifier")
+    parser.add_argument("--adv-paper-aug-epochs", type=int, default=60000,
+                        help="full-batch SGD steps for the noise-aug / coupled PaperClassifier")
+    parser.add_argument("--adv-paper-lr", type=float, default=0.002)
+    parser.add_argument("--adv-kde-sigma", type=float, default=0.020,
+                        help="bandwidth for the KDE 'diffusion classifier' panel "
+                             "(σ_x = σ·√D_x ≈ {sx:.3f}, σ_y = σ·√D_y ≈ {sy:.2f})".format(
+                                 sx=0.020 * math.sqrt(D_X_ADV),
+                                 sy=0.020 * math.sqrt(D_Y_ADV)))
+    parser.add_argument("--adv-kde-alpha", type=float, default=0.01,
+                        help="uniform-mixture floor for KDE (off-manifold fadeout to 0.5)")
     parser.add_argument("--rho-fig", action="store_true",
                         help="also write the ρ-curve auxiliary figure (per mode)")
     parser.add_argument("--seed", type=int, default=42)
@@ -820,12 +1157,14 @@ def main():
     results = []
     for m in modes:
         print(f"\n========== {m.upper()} ==========")
-        res = run_one_mode(m, args, device)
+        res = (run_adversarial_mode(args, device)
+               if m == "adversarial"
+               else run_one_mode(m, args, device))
         results.append(res)
         # Always save the single-mode 1×4 PDF too
         single_path = args.out_dir / f"fig_{m}_toy.pdf"
         fig_single_mode(res["cfg"], res["X_orig"], res["Y"], res["fields"], single_path)
-        if args.rho_fig:
+        if args.rho_fig and res["ddpm"] is not None:
             rho_fig_path = args.out_dir / f"fig_{m}_rho.pdf"
             fig_rho_curve(res["rho_raw"], res["rho_clean"], res["ddpm"],
                           res["X_train"], res["Y"], rho_fig_path,
