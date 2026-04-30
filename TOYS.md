@@ -10,62 +10,44 @@ toy showing all four side by side.
 
 ## The three toys
 
-| `--mode`        | Story                          | Data                                              | What we compare                                                          |
-| --------------- | ------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------ |
-| `stripes`       | **Spurious correlation**       | Stripe labels along `x`; planted `y` shortcut     | Vanilla follows the easy y-shortcut; ours / DC use the real x-stripe signal |
-| `chess`         | **Human-aligned concept**      | 5×5 chess pattern, 25 jittered cell centres       | Vanilla over-extrapolates; ours / DC respect the chess cells             |
-| `adversarial`   | **Off-manifold robustness**    | 7 alternating-label points along `y=0` (Melamed)  | y = "3000-D off-manifold", x = "20-D on-manifold" — anisotropic noise    |
+| `--mode`        | Story                          | Data                                                                              |
+| --------------- | ------------------------------ | --------------------------------------------------------------------------------- |
+| `stripes`       | **Spurious correlation**       | Stripe labels along `x`; planted `y` shortcut                                     |
+| `chess`         | **Human-aligned concept**      | 5×5 chess pattern, 25 jittered cell centres                                       |
+| `adversarial`   | **Train-on-centres / test-on-jitter** | 7 cluster centres at `y=0` (training) + jittered samples (test, plotted shaded) |
 
-The four panels per mode are:
+All three toys share the same 4-panel layout:
 
-| Mode               | Col 1                       | Col 2                  | Col 3                                    | Col 4                  |
-| ------------------ | --------------------------- | ---------------------- | ---------------------------------------- | ---------------------- |
-| `stripes`/`chess`  | Ground-truth labels         | Vanilla CE             | Coupled CE — matched ρ(t) (ours)         | Diffusion classifier   |
-| `adversarial`      | Vanilla CE (no aug.)        | Adversarial training   | Coupled CE — matched ρ(t) (ours)         | Diffusion classifier   |
+| Col 1 | Col 2 | Col 3 | Col 4 |
+| ----- | ----- | ----- | ----- |
+| Ground-truth labels | Vanilla CE | Coupled CE — matched ρ(t) (ours) | Diffusion classifier |
 
-Where:
+The "ground truth" panel paints the labelling a human would give based on
+the points (vertical stripes for `stripes` and `adversarial`; chess cells
+for `chess`). The other three panels show each classifier's
+`P(c=1|x) − 0.5` field on top of the same data overlay.
 
-- **Vanilla CE (no aug.)** — standard cross-entropy on the clean training points.
-- **Adversarial training** — same noise-augmentation sampler as ours
-  (`t ~ q(t) ∝ |Δρ(t)|`, anisotropic noise via prescaling) but with **sharp**
-  one-hot targets (ρ ≡ 1). This reproduces the dimpled-manifold adversarial-
-  training behaviour from Melamed et al. (2023): the boundary fits the noised
-  data manifold cleanly but stays unconstrained off it.
-- **Coupled CE (ours)** — same noise sampler, but with the matched-ρ soft
-  target `c_t = ρ(t)·onehot(c) + (1−ρ(t))·u`.
-- **Diffusion classifier** — the trained DDPM accumulating
-  `Σ_{t ≥ t_ref}(‖ε−ε_θ(c=0)‖² − ‖ε−ε_θ(c=1)‖²)`.
-
-For `stripes` and `chess` we don't show "adversarial training" because there
-is no off-manifold ambiguity — the data is dense and the relevant comparison
-is *what feature the classifier latches onto*, not *what it does far from
-data*. Conversely, for `adversarial` there's no clean "ground truth" panel
-because the adversarial-robustness story is precisely about the
-*non-existence* of any pattern between the seven training points: each
-classifier paints its own reasonable extrapolation, and the four panels show
-how different training procedures shape that extrapolation.
+For `adversarial`: the classifier is trained **only** on the 7 cluster
+centres (filled dots in every panel). Jittered test points (dashed black
+border, 40 % alpha) are *not* used during training — they are there to
+expose how each classifier extrapolates near the training manifold. The
+hypothesis is that vanilla CE clings tightly to the seven centres and
+mis-classifies test points that drift across boundaries, while the coupled
+classifier and the diffusion classifier produce stripe-respecting
+boundaries that hold up under jitter.
 
 ## How the adversarial mode is implemented
 
-The adversarial-robustness toy is implemented separately from `stripes` and
-`chess` — it does **not** use a DDPM. The components are ported from the
-`/home/emirhan/off-manifold-noise-augment` codebase:
+Same DDPM + MLP pipeline as `stripes` and `chess`. The only differences:
 
-- **PaperClassifier** — the 2-layer ReLU width-4000 classifier of Melamed et
-  al. 2023 (random ±1 second-layer init, full-batch SGD, BCE). Its dimpled-
-  manifold inductive bias is what makes the no-augmentation panel show the
-  characteristic "boundary clings to the data line" pattern; a generic MLP +
-  Adam smooths that out.
-- **Anisotropic noise sampler** — for each step, `σ ~ Uniform[σ_min, σ_max]`
-  (defaults `[0.001, 0.020]`), then the per-axis noise std is `σ·√D_axis`
-  with `D_x = 20` (on-manifold) and `D_y = 3000` (off-manifold).
-- **ρ(σ)** — computed analytically from the data's KDE-mixture posterior by
-  Monte-Carlo over noised samples (`estimate_rho_kde`).
-- **KDE classifier** — Gaussian KDE per class with anisotropic bandwidth
-  `σ·√D_axis`, plus a uniform mixture floor so the posterior fades to 0.5
-  off-manifold (matches `run_diffusion_classifier.py` in the source codebase).
-
-Stripes and chess modes still use the DDPM + MLP pipeline unchanged.
+- `make_adversarial` returns **only** the 7 cluster centres (`y=0`,
+  alternating labels). All three classifiers (vanilla, coupled, DDPM) are
+  trained on these 7 points.
+- `make_adversarial_test` produces a separate jittered test set (default
+  18 samples per centre with `σ_x = σ_y = 0.10`). These points are *not*
+  used for training; they are passed through to the figure renderer and
+  drawn shaded with dashed borders so you can see which test points the
+  classifier mis-classifies.
 
 ## Running
 
